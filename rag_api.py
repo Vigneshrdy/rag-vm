@@ -1,6 +1,6 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from typing import Dict, List
+from typing import Dict
 import os
 
 from openai import AzureOpenAI
@@ -25,10 +25,10 @@ DEPLOYMENT_NAME = os.environ["AZURE_OPENAI_DEPLOYMENT"]
 # =========================
 # FastAPI
 # =========================
-app = FastAPI()
+app = FastAPI(title="Nyaya AI API")
 
 # =========================
-# Memory Stores
+# In-memory document index
 # =========================
 DOCUMENT_INDEX: Dict[str, FAISS] = {}
 
@@ -46,35 +46,46 @@ def extract_text(file, filename: str) -> str:
     if filename.endswith(".pdf"):
         reader = PdfReader(file)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
-    elif filename.endswith(".docx"):
+
+    if filename.endswith(".docx"):
         doc = DocxDocument(file)
         return "\n".join(p.text for p in doc.paragraphs)
-    elif filename.endswith(".txt"):
+
+    if filename.endswith(".txt"):
         return file.read().decode("utf-8")
-    else:
-        raise ValueError("Unsupported file")
+
+    raise ValueError("Unsupported file type")
 
 # =========================
 # Upload + Summarize
 # =========================
-@app.post("/upload")
+@app.post("/api/upload")
 async def upload(session_id: str, file: UploadFile = File(...)):
-    text = extract_text(file.file, file.filename)
+    if not file:
+        raise HTTPException(status_code=400, detail="No file received")
+
+    print("📄 Received file:", file.filename)
+
+    try:
+        text = extract_text(file.file, file.filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Empty document")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
         chunk_overlap=150
     )
 
-    docs = splitter.split_documents(
-        [Document(page_content=text)]
-    )
-
-    vs = FAISS.from_documents(docs, embeddings)
-    DOCUMENT_INDEX[session_id] = vs
+    docs = splitter.split_documents([Document(page_content=text)])
+    vectorstore = FAISS.from_documents(docs, embeddings)
+    DOCUMENT_INDEX[session_id] = vectorstore
 
     context = "\n\n".join(
-        d.page_content for d in vs.similarity_search("summarize judgment", k=6)
+        d.page_content
+        for d in vectorstore.similarity_search("summarize judgment", k=6)
     )
 
     resp = client.chat.completions.create(
@@ -83,31 +94,34 @@ async def upload(session_id: str, file: UploadFile = File(...)):
             {
                 "role": "system",
                 "content": (
-                    "Summarize the judgment.\n"
-                    "Include Facts, Issues, Decision.\n"
-                    "Mention Sections & Acts explicitly."
-                )
+                    "Summarize the legal document.\n"
+                    "Use headings: Facts, Issues, Decision, Relevant Provisions.\n"
+                    "Explicitly mention Sections & Acts."
+                ),
             },
-            {"role": "user", "content": context}
+            {"role": "user", "content": context},
         ],
     )
 
-    return {"summary": resp.choices[0].message.content}
+    return {
+        "summary": resp.choices[0].message.content,
+        "filename": file.filename,
+    }
 
 # =========================
-# Ask on Uploaded Document
+# Ask on uploaded document
 # =========================
 class DocQuery(BaseModel):
     session_id: str
     question: str
 
-@app.post("/ask-document")
+@app.post("/api/ask-document")
 def ask_document(q: DocQuery):
     if q.session_id not in DOCUMENT_INDEX:
         return {"answer": "No document uploaded for this session."}
 
-    vs = DOCUMENT_INDEX[q.session_id]
-    docs = vs.similarity_search(q.question, k=5)
+    vectorstore = DOCUMENT_INDEX[q.session_id]
+    docs = vectorstore.similarity_search(q.question, k=5)
     context = "\n\n".join(d.page_content for d in docs)
 
     resp = client.chat.completions.create(
@@ -118,10 +132,35 @@ def ask_document(q: DocQuery):
                 "content": (
                     "Answer ONLY from the document.\n"
                     "Mention Sections & Acts if present.\n"
-                    "If missing, say not mentioned."
-                )
+                    "If missing, say 'Not mentioned in the document'."
+                ),
             },
-            {"role": "user", "content": context + "\n\nQ: " + q.question}
+            {"role": "user", "content": context + "\n\nQ: " + q.question},
+        ],
+    )
+
+    return {"answer": resp.choices[0].message.content}
+
+# =========================
+# Normal Chat
+# =========================
+class AskQuery(BaseModel):
+    session_id: str
+    question: str
+
+@app.post("/api/ask")
+def ask(q: AskQuery):
+    resp = client.chat.completions.create(
+        model=DEPLOYMENT_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are Nyaya AI, an Indian legal assistant. "
+                    "Answer clearly and concisely."
+                ),
+            },
+            {"role": "user", "content": q.question},
         ],
     )
 
