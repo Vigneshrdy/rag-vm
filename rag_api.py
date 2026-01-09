@@ -1,9 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from typing import Dict
-import os
+import os, json
+from pathlib import Path
 
 from openai import AzureOpenAI
+from supabase import create_client
+
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -13,7 +16,7 @@ from pypdf import PdfReader
 from docx import Document as DocxDocument
 
 # =========================
-# Azure OpenAI
+# ENV
 # =========================
 client = AzureOpenAI(
     api_key=os.environ["AZURE_OPENAI_API_KEY"],
@@ -22,57 +25,88 @@ client = AzureOpenAI(
 )
 DEPLOYMENT_NAME = os.environ["AZURE_OPENAI_DEPLOYMENT"]
 
+supabase = create_client(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_SERVICE_KEY"]
+)
+
 # =========================
-# FastAPI
+# APP
 # =========================
 app = FastAPI(title="Nyaya AI API")
 
 # =========================
-# In-memory document index
+# STORAGE
 # =========================
 DOCUMENT_INDEX: Dict[str, FAISS] = {}
+CHAT_DIR = Path("chats")
+CHAT_DIR.mkdir(exist_ok=True)
 
 # =========================
-# Embeddings
+# EMBEDDINGS
 # =========================
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
 # =========================
-# Utils
+# UTILS
 # =========================
 def extract_text(file, filename: str) -> str:
     if filename.endswith(".pdf"):
         reader = PdfReader(file)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
-
     if filename.endswith(".docx"):
         doc = DocxDocument(file)
         return "\n".join(p.text for p in doc.paragraphs)
-
     if filename.endswith(".txt"):
         return file.read().decode("utf-8")
-
     raise ValueError("Unsupported file type")
 
+
+def save_chat(session_id, role, content):
+    path = CHAT_DIR / f"{session_id}.json"
+    chats = json.loads(path.read_text()) if path.exists() else []
+    chats.append({"role": role, "content": content})
+    path.write_text(json.dumps(chats, indent=2))
+
+
+def is_legal_document(text: str):
+    resp = client.chat.completions.create(
+        model=DEPLOYMENT_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Classify document relevance to Indian law.\n"
+                    "Legal documents include judgments, FIRs, contracts, petitions, acts.\n"
+                    "Reply strictly as JSON:\n"
+                    "{ \"legal\": true/false, \"reason\": \"short reason\" }"
+                )
+            },
+            {"role": "user", "content": text[:3000]}
+        ]
+    )
+    return json.loads(resp.choices[0].message.content)
+
 # =========================
-# Upload + Summarize
+# UPLOAD
 # =========================
 @app.post("/api/upload")
 async def upload(session_id: str, file: UploadFile = File(...)):
-    if not file:
-        raise HTTPException(status_code=400, detail="No file received")
+    text = extract_text(file.file, file.filename)
 
-    print("📄 Received file:", file.filename)
+    verdict = is_legal_document(text)
 
-    try:
-        text = extract_text(file.file, file.filename)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    supabase.table("documents").insert({
+        "session_id": session_id,
+        "filename": file.filename,
+        "is_legal": verdict["legal"],
+        "reason": verdict["reason"]
+    }).execute()
 
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Empty document")
+    if not verdict["legal"]:
+        raise HTTPException(400, verdict["reason"])
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
@@ -94,22 +128,21 @@ async def upload(session_id: str, file: UploadFile = File(...)):
             {
                 "role": "system",
                 "content": (
-                    "Summarize the legal document.\n"
-                    "Use headings: Facts, Issues, Decision, Relevant Provisions.\n"
-                    "Explicitly mention Sections & Acts."
-                ),
+                    "Summarize legal document.\n"
+                    "Headings: Facts, Issues, Decision, Relevant Provisions."
+                )
             },
-            {"role": "user", "content": context},
-        ],
+            {"role": "user", "content": context}
+        ]
     )
 
-    return {
-        "summary": resp.choices[0].message.content,
-        "filename": file.filename,
-    }
+    summary = resp.choices[0].message.content
+    save_chat(session_id, "assistant", summary)
+
+    return {"summary": summary}
 
 # =========================
-# Ask on uploaded document
+# ASK DOCUMENT
 # =========================
 class DocQuery(BaseModel):
     session_id: str
@@ -118,10 +151,11 @@ class DocQuery(BaseModel):
 @app.post("/api/ask-document")
 def ask_document(q: DocQuery):
     if q.session_id not in DOCUMENT_INDEX:
-        return {"answer": "No document uploaded for this session."}
+        return {"answer": "No document uploaded."}
 
-    vectorstore = DOCUMENT_INDEX[q.session_id]
-    docs = vectorstore.similarity_search(q.question, k=5)
+    save_chat(q.session_id, "user", q.question)
+
+    docs = DOCUMENT_INDEX[q.session_id].similarity_search(q.question, k=5)
     context = "\n\n".join(d.page_content for d in docs)
 
     resp = client.chat.completions.create(
@@ -130,19 +164,21 @@ def ask_document(q: DocQuery):
             {
                 "role": "system",
                 "content": (
-                    "Answer ONLY from the document.\n"
-                    "Mention Sections & Acts if present.\n"
-                    "If missing, say 'Not mentioned in the document'."
-                ),
+                    "Answer ONLY from document.\n"
+                    "If not found say 'Not mentioned in the document'."
+                )
             },
-            {"role": "user", "content": context + "\n\nQ: " + q.question},
-        ],
+            {"role": "user", "content": context + "\n\nQ: " + q.question}
+        ]
     )
 
-    return {"answer": resp.choices[0].message.content}
+    answer = resp.choices[0].message.content
+    save_chat(q.session_id, "assistant", answer)
+
+    return {"answer": answer}
 
 # =========================
-# Normal Chat
+# NORMAL CHAT
 # =========================
 class AskQuery(BaseModel):
     session_id: str
@@ -150,18 +186,17 @@ class AskQuery(BaseModel):
 
 @app.post("/api/ask")
 def ask(q: AskQuery):
+    save_chat(q.session_id, "user", q.question)
+
     resp = client.chat.completions.create(
         model=DEPLOYMENT_NAME,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are Nyaya AI, an Indian legal assistant. "
-                    "Answer clearly and concisely."
-                ),
-            },
-            {"role": "user", "content": q.question},
-        ],
+            {"role": "system", "content": "You are Nyaya AI, Indian legal assistant."},
+            {"role": "user", "content": q.question}
+        ]
     )
 
-    return {"answer": resp.choices[0].message.content}
+    answer = resp.choices[0].message.content
+    save_chat(q.session_id, "assistant", answer)
+
+    return {"answer": answer}
