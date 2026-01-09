@@ -16,30 +16,52 @@ from pypdf import PdfReader
 from docx import Document as DocxDocument
 
 # =========================
-# ENV
+# ENV (SAFE LOAD)
+# =========================
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+if not all([
+    AZURE_OPENAI_API_KEY,
+    AZURE_OPENAI_API_VERSION,
+    AZURE_OPENAI_ENDPOINT,
+    AZURE_OPENAI_DEPLOYMENT,
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY
+]):
+    raise RuntimeError("One or more environment variables are missing")
+
+# =========================
+# CLIENTS
 # =========================
 client = AzureOpenAI(
-    api_key=os.environ["AZURE_OPENAI_API_KEY"],
-    api_version=os.environ["AZURE_OPENAI_API_VERSION"],
-    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=AZURE_OPENAI_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
 )
-DEPLOYMENT_NAME = os.environ["AZURE_OPENAI_DEPLOYMENT"]
 
-supabase = create_client(
-    os.environ["SUPABASE_URL"],
-    os.environ["SUPABASE_SERVICE_KEY"]
-)
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # =========================
 # APP
 # =========================
-app = FastAPI(title="Nyaya AI API")
+app = FastAPI(title="Nyaya AI RAG API")
 
 # =========================
 # STORAGE
 # =========================
 DOCUMENT_INDEX: Dict[str, FAISS] = {}
-CHAT_DIR = Path("chats")
+
+BASE_DIR = Path(".")
+UPLOAD_DIR = BASE_DIR / "uploads"
+CHAT_DIR = BASE_DIR / "chats"
+
+UPLOAD_DIR.mkdir(exist_ok=True)
 CHAT_DIR.mkdir(exist_ok=True)
 
 # =========================
@@ -53,34 +75,46 @@ embeddings = HuggingFaceEmbeddings(
 # UTILS
 # =========================
 def extract_text(file, filename: str) -> str:
-    if filename.endswith(".pdf"):
+    if filename.lower().endswith(".pdf"):
         reader = PdfReader(file)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
-    if filename.endswith(".docx"):
+
+    if filename.lower().endswith(".docx"):
         doc = DocxDocument(file)
         return "\n".join(p.text for p in doc.paragraphs)
-    if filename.endswith(".txt"):
+
+    if filename.lower().endswith(".txt"):
         return file.read().decode("utf-8")
+
     raise ValueError("Unsupported file type")
 
 
-def save_chat(session_id, role, content):
+def save_chat_local(session_id: str, role: str, content: str):
     path = CHAT_DIR / f"{session_id}.json"
-    chats = json.loads(path.read_text()) if path.exists() else []
-    chats.append({"role": role, "content": content})
-    path.write_text(json.dumps(chats, indent=2))
+    data = json.loads(path.read_text()) if path.exists() else []
+    data.append({"role": role, "content": content})
+    path.write_text(json.dumps(data, indent=2))
 
 
-def is_legal_document(text: str):
+def save_chat_db(session_id: str, source: str, question: str, answer: str):
+    supabase.table("chats").insert({
+        "session_id": session_id,
+        "source": source,
+        "question": question,
+        "answer": answer
+    }).execute()
+
+
+def is_legal_document(text: str) -> dict:
     resp = client.chat.completions.create(
-        model=DEPLOYMENT_NAME,
+        model=AZURE_OPENAI_DEPLOYMENT,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Classify document relevance to Indian law.\n"
-                    "Legal documents include judgments, FIRs, contracts, petitions, acts.\n"
-                    "Reply strictly as JSON:\n"
+                    "You are a classifier for Indian legal documents.\n"
+                    "Legal documents include judgments, FIRs, petitions, contracts, notices, Acts.\n"
+                    "Reply STRICTLY in JSON:\n"
                     "{ \"legal\": true/false, \"reason\": \"short reason\" }"
                 )
             },
@@ -90,23 +124,33 @@ def is_legal_document(text: str):
     return json.loads(resp.choices[0].message.content)
 
 # =========================
-# UPLOAD
+# UPLOAD + SUMMARY
 # =========================
 @app.post("/api/upload")
 async def upload(session_id: str, file: UploadFile = File(...)):
-    text = extract_text(file.file, file.filename)
+    session_dir = UPLOAD_DIR / session_id
+    session_dir.mkdir(exist_ok=True)
+
+    file_path = session_dir / file.filename
+
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+
+    with open(file_path, "rb") as f:
+        text = extract_text(f, file.filename)
 
     verdict = is_legal_document(text)
 
     supabase.table("documents").insert({
         "session_id": session_id,
         "filename": file.filename,
+        "file_path": str(file_path),
         "is_legal": verdict["legal"],
         "reason": verdict["reason"]
     }).execute()
 
     if not verdict["legal"]:
-        raise HTTPException(400, verdict["reason"])
+        raise HTTPException(400, f"Rejected: {verdict['reason']}")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
@@ -123,13 +167,25 @@ async def upload(session_id: str, file: UploadFile = File(...)):
     )
 
     resp = client.chat.completions.create(
-        model=DEPLOYMENT_NAME,
+        model=AZURE_OPENAI_DEPLOYMENT,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Summarize legal document.\n"
-                    "Headings: Facts, Issues, Decision, Relevant Provisions."
+                    "Summarize the legal document in Markdown.\n"
+                    "Rules:\n"
+                    "- Use headings\n"
+                    "- Use numbered points\n"
+                    "- Add spacing\n\n"
+                    "Format:\n"
+                    "### Facts\n"
+                    "1. ...\n\n"
+                    "### Issues\n"
+                    "1. ...\n\n"
+                    "### Decision\n"
+                    "- ...\n\n"
+                    "### Relevant Provisions\n"
+                    "- Section ... of ... Act"
                 )
             },
             {"role": "user", "content": context}
@@ -137,12 +193,12 @@ async def upload(session_id: str, file: UploadFile = File(...)):
     )
 
     summary = resp.choices[0].message.content
-    save_chat(session_id, "assistant", summary)
+    save_chat_local(session_id, "assistant", summary)
 
     return {"summary": summary}
 
 # =========================
-# ASK DOCUMENT
+# ASK DOCUMENT (RAG)
 # =========================
 class DocQuery(BaseModel):
     session_id: str
@@ -151,21 +207,23 @@ class DocQuery(BaseModel):
 @app.post("/api/ask-document")
 def ask_document(q: DocQuery):
     if q.session_id not in DOCUMENT_INDEX:
-        return {"answer": "No document uploaded."}
+        return {"answer": "No document uploaded for this session."}
 
-    save_chat(q.session_id, "user", q.question)
+    save_chat_local(q.session_id, "user", q.question)
 
     docs = DOCUMENT_INDEX[q.session_id].similarity_search(q.question, k=5)
     context = "\n\n".join(d.page_content for d in docs)
 
     resp = client.chat.completions.create(
-        model=DEPLOYMENT_NAME,
+        model=AZURE_OPENAI_DEPLOYMENT,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Answer ONLY from document.\n"
-                    "If not found say 'Not mentioned in the document'."
+                    "Answer ONLY from the document.\n"
+                    "Use Markdown, bullet points, and line breaks.\n"
+                    "Mention Sections/Acts clearly.\n"
+                    "If not found, reply exactly: Not mentioned in the document."
                 )
             },
             {"role": "user", "content": context + "\n\nQ: " + q.question}
@@ -173,7 +231,9 @@ def ask_document(q: DocQuery):
     )
 
     answer = resp.choices[0].message.content
-    save_chat(q.session_id, "assistant", answer)
+
+    save_chat_local(q.session_id, "assistant", answer)
+    save_chat_db(q.session_id, "document", q.question, answer)
 
     return {"answer": answer}
 
@@ -186,17 +246,26 @@ class AskQuery(BaseModel):
 
 @app.post("/api/ask")
 def ask(q: AskQuery):
-    save_chat(q.session_id, "user", q.question)
+    save_chat_local(q.session_id, "user", q.question)
 
     resp = client.chat.completions.create(
-        model=DEPLOYMENT_NAME,
+        model=AZURE_OPENAI_DEPLOYMENT,
         messages=[
-            {"role": "system", "content": "You are Nyaya AI, Indian legal assistant."},
+            {
+                "role": "system",
+                "content": (
+                    "You are Nyaya AI, an Indian legal assistant.\n"
+                    "Respond clearly in Markdown.\n"
+                    "Do not give legal advice."
+                )
+            },
             {"role": "user", "content": q.question}
         ]
     )
 
     answer = resp.choices[0].message.content
-    save_chat(q.session_id, "assistant", answer)
+
+    save_chat_local(q.session_id, "assistant", answer)
+    save_chat_db(q.session_id, "normal", q.question, answer)
 
     return {"answer": answer}
