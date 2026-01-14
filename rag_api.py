@@ -15,9 +15,9 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 
-# =========================
+# =====================================================
 # ENV (SAFE LOAD)
-# =========================
+# =====================================================
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -32,13 +32,13 @@ if not all([
     AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_DEPLOYMENT,
     SUPABASE_URL,
-    SUPABASE_SERVICE_KEY
+    SUPABASE_SERVICE_KEY,
 ]):
-    raise RuntimeError("One or more environment variables are missing")
+    raise RuntimeError("Missing environment variables")
 
-# =========================
+# =====================================================
 # CLIENTS
-# =========================
+# =====================================================
 client = AzureOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
     api_version=AZURE_OPENAI_API_VERSION,
@@ -47,14 +47,14 @@ client = AzureOpenAI(
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# =========================
+# =====================================================
 # APP
-# =========================
-app = FastAPI(title="Nyaya AI RAG API")
+# =====================================================
+app = FastAPI(title="Nyaya AI – Full RAG API")
 
-# =========================
+# =====================================================
 # STORAGE
-# =========================
+# =====================================================
 DOCUMENT_INDEX: Dict[str, FAISS] = {}
 
 BASE_DIR = Path(".")
@@ -64,16 +64,16 @@ CHAT_DIR = BASE_DIR / "chats"
 UPLOAD_DIR.mkdir(exist_ok=True)
 CHAT_DIR.mkdir(exist_ok=True)
 
-# =========================
+# =====================================================
 # EMBEDDINGS
-# =========================
+# =====================================================
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# =========================
+# =====================================================
 # UTILS
-# =========================
+# =====================================================
 def extract_text(file, filename: str) -> str:
     if filename.lower().endswith(".pdf"):
         reader = PdfReader(file)
@@ -112,8 +112,8 @@ def is_legal_document(text: str) -> dict:
             {
                 "role": "system",
                 "content": (
-                    "You are a classifier for Indian legal documents.\n"
-                    "Legal documents include judgments, FIRs, petitions, contracts, notices, Acts.\n"
+                    "Classify if the document is a legal document under Indian law.\n"
+                    "Legal documents include judgments, FIRs, contracts, petitions, notices, Acts.\n"
                     "Reply STRICTLY in JSON:\n"
                     "{ \"legal\": true/false, \"reason\": \"short reason\" }"
                 )
@@ -123,25 +123,27 @@ def is_legal_document(text: str) -> dict:
     )
     return json.loads(resp.choices[0].message.content)
 
-# =========================
-# UPLOAD + SUMMARY
-# =========================
+# =====================================================
+# UPLOAD + SUMMARY (RAG INGESTION)
+# =====================================================
 @app.post("/api/upload")
 async def upload(session_id: str, file: UploadFile = File(...)):
+    # Save file
     session_dir = UPLOAD_DIR / session_id
     session_dir.mkdir(exist_ok=True)
 
     file_path = session_dir / file.filename
-
     with open(file_path, "wb") as f:
         f.write(await file.read())
 
     with open(file_path, "rb") as f:
         text = extract_text(f, file.filename)
 
+    # Legal relevance check
     verdict = is_legal_document(text)
 
-    supabase.table("documents").insert({
+    # Insert metadata first
+    insert_resp = supabase.table("documents").insert({
         "session_id": session_id,
         "filename": file.filename,
         "file_path": str(file_path),
@@ -149,9 +151,12 @@ async def upload(session_id: str, file: UploadFile = File(...)):
         "reason": verdict["reason"]
     }).execute()
 
+    document_id = insert_resp.data[0]["id"]
+
     if not verdict["legal"]:
         raise HTTPException(400, f"Rejected: {verdict['reason']}")
 
+    # Chunk + embed
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
         chunk_overlap=150
@@ -161,11 +166,13 @@ async def upload(session_id: str, file: UploadFile = File(...)):
     vectorstore = FAISS.from_documents(docs, embeddings)
     DOCUMENT_INDEX[session_id] = vectorstore
 
+    # Retrieve best chunks for summary
     context = "\n\n".join(
         d.page_content
         for d in vectorstore.similarity_search("summarize judgment", k=6)
     )
 
+    # Generate summary
     resp = client.chat.completions.create(
         model=AZURE_OPENAI_DEPLOYMENT,
         messages=[
@@ -173,19 +180,11 @@ async def upload(session_id: str, file: UploadFile = File(...)):
                 "role": "system",
                 "content": (
                     "Summarize the legal document in Markdown.\n"
-                    "Rules:\n"
-                    "- Use headings\n"
-                    "- Use numbered points\n"
-                    "- Add spacing\n\n"
-                    "Format:\n"
+                    "Format strictly as:\n"
                     "### Facts\n"
-                    "1. ...\n\n"
                     "### Issues\n"
-                    "1. ...\n\n"
                     "### Decision\n"
-                    "- ...\n\n"
-                    "### Relevant Provisions\n"
-                    "- Section ... of ... Act"
+                    "### Relevant Provisions"
                 )
             },
             {"role": "user", "content": context}
@@ -193,13 +192,19 @@ async def upload(session_id: str, file: UploadFile = File(...)):
     )
 
     summary = resp.choices[0].message.content
+
+    # Save summary to documents table
+    supabase.table("documents").update({
+        "summary": summary
+    }).eq("id", document_id).execute()
+
     save_chat_local(session_id, "assistant", summary)
 
     return {"summary": summary}
 
-# =========================
-# ASK DOCUMENT (RAG)
-# =========================
+# =====================================================
+# ASK DOCUMENT (RAG QA)
+# =====================================================
 class DocQuery(BaseModel):
     session_id: str
     question: str
@@ -221,9 +226,8 @@ def ask_document(q: DocQuery):
                 "role": "system",
                 "content": (
                     "Answer ONLY from the document.\n"
-                    "Use Markdown, bullet points, and line breaks.\n"
-                    "Mention Sections/Acts clearly.\n"
-                    "If not found, reply exactly: Not mentioned in the document."
+                    "Use Markdown formatting.\n"
+                    "If not present, reply exactly: Not mentioned in the document."
                 )
             },
             {"role": "user", "content": context + "\n\nQ: " + q.question}
@@ -237,9 +241,9 @@ def ask_document(q: DocQuery):
 
     return {"answer": answer}
 
-# =========================
+# =====================================================
 # NORMAL CHAT
-# =========================
+# =====================================================
 class AskQuery(BaseModel):
     session_id: str
     question: str
@@ -255,7 +259,7 @@ def ask(q: AskQuery):
                 "role": "system",
                 "content": (
                     "You are Nyaya AI, an Indian legal assistant.\n"
-                    "Respond clearly in Markdown.\n"
+                    "Respond in Markdown.\n"
                     "Do not give legal advice."
                 )
             },
