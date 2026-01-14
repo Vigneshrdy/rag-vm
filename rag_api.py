@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import Dict
 import os, json
 from pathlib import Path
-
+from datetime import datetime, timedelta
 from openai import AzureOpenAI
 from supabase import create_client
 
@@ -63,6 +63,54 @@ CHAT_DIR = BASE_DIR / "chats"
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 CHAT_DIR.mkdir(exist_ok=True)
+
+
+@app.post("/api/share-chat")
+def share_chat(payload: dict):
+    session_id = payload.get("session_id")
+
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+
+    # Load local chat snapshot
+    path = CHAT_DIR / f"{session_id}.json"
+    if not path.exists():
+        raise HTTPException(404, "Chat not found")
+
+    messages = json.loads(path.read_text())
+
+    expires_at = datetime.utcnow() + timedelta(days=30)
+
+    result = supabase.table("shared_chats").insert({
+        "session_id": session_id,
+        "messages": messages,
+        "expires_at": expires_at.isoformat()
+    }).execute()
+
+    share_id = result.data[0]["id"]
+
+    return {
+        "share_url": f"{os.getenv('APP_URL')}/share/{share_id}"
+    }
+@app.get("/api/share/{share_id}")
+def get_shared_chat(share_id: str):
+    result = supabase.table("shared_chats") \
+        .select("messages, expires_at") \
+        .eq("id", share_id) \
+        .single() \
+        .execute()
+
+    if not result.data:
+        raise HTTPException(404, "Chat not found")
+
+    expires_at = result.data["expires_at"]
+    if expires_at:
+        if datetime.utcnow() > datetime.fromisoformat(expires_at):
+            raise HTTPException(410, "Chat expired")
+
+    return {
+        "messages": result.data["messages"]
+    }
 
 # =====================================================
 # EMBEDDINGS
