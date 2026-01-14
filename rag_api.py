@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from typing import Dict
@@ -138,19 +139,7 @@ def extract_text(file, filename: str) -> str:
         return file.read().decode("utf-8")
     raise ValueError("Unsupported file type")
 
-def save_chat_local(session_id: str, role: str, content: str):
-    path = CHAT_DIR / f"{session_id}.json"
-    data = json.loads(path.read_text()) if path.exists() else []
-    data.append({"role": role, "content": content})
-    path.write_text(json.dumps(data, indent=2))
 
-def save_chat_db(session_id: str, source: str, question: str, answer: str):
-    supabase.table("chats").insert({
-        "session_id": session_id,
-        "source": source,
-        "question": question,
-        "answer": answer
-    }).execute()
 
 # =====================================================
 # MAIN API CONTINUES...
