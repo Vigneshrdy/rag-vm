@@ -13,6 +13,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
+from fastapi import HTTPException
 
 from pypdf import PdfReader
 from docx import Document as DocxDocument
@@ -67,44 +68,51 @@ CHAT_DIR.mkdir(exist_ok=True)
 
 @app.post("/api/share-chat")
 def share_chat(payload: dict):
-    session_id = payload["session_id"]
+    session_id = payload.get("session_id")
+    if not session_id:
+        raise HTTPException(400, "session_id is required")
 
-    # 1️⃣ Check if already shared
+    # 1️⃣ Try to find existing share
     existing = (
         supabase.table("shared_chats")
         .select("id")
         .eq("session_id", session_id)
-        .maybe_single()
+        .limit(1)
         .execute()
     )
 
-    if existing.data:
-        share_id = existing.data["id"]
+    # ✅ SAFE CHECK
+    if existing and existing.data:
+        share_id = existing.data[0]["id"]
     else:
-        # 2️⃣ Create new share
-        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-
+        # 2️⃣ Fetch messages for this session
         chat = (
-            supabase.table("chat_sessions")
-            .select("messages")
+            supabase.table("chats")
+            .select("question, answer, source, created_at")
             .eq("session_id", session_id)
-            .single()
+            .order("created_at")
             .execute()
         )
+
+        if not chat.data:
+            raise HTTPException(404, "No chat found for this session")
+
+        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
 
         insert = (
             supabase.table("shared_chats")
             .insert({
                 "session_id": session_id,
-                "messages": chat.data["messages"],
+                "messages": chat.data,  # full chat history
                 "expires_at": expires_at.isoformat(),
+                "is_public": True,
             })
             .execute()
         )
 
         share_id = insert.data[0]["id"]
 
-    # 3️⃣ ALWAYS return your domain
+    # 3️⃣ ALWAYS return stable URL
     return {
         "share_url": f"https://nyayaai.saireddy.dev/share/{share_id}"
     }
