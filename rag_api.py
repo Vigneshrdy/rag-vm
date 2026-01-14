@@ -3,7 +3,8 @@ from pydantic import BaseModel
 from typing import Dict
 import os, json
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
 from openai import AzureOpenAI
 from supabase import create_client
 
@@ -25,6 +26,7 @@ AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+APP_URL = os.getenv("APP_URL", "http://localhost:5173")
 
 if not all([
     AZURE_OPENAI_API_KEY,
@@ -36,9 +38,6 @@ if not all([
 ]):
     raise RuntimeError("Missing environment variables")
 
-# =====================================================
-# CLIENTS
-# =====================================================
 client = AzureOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
     api_version=AZURE_OPENAI_API_VERSION,
@@ -47,9 +46,6 @@ client = AzureOpenAI(
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# =====================================================
-# APP
-# =====================================================
 app = FastAPI(title="Nyaya AI – Full RAG API")
 
 # =====================================================
@@ -64,34 +60,45 @@ CHAT_DIR = BASE_DIR / "chats"
 UPLOAD_DIR.mkdir(exist_ok=True)
 CHAT_DIR.mkdir(exist_ok=True)
 
+# =====================================================
+# SHARE CHAT ENDPOINTS
+# =====================================================
 
 @app.post("/api/share-chat")
 def share_chat(payload: dict):
     session_id = payload.get("session_id")
-
     if not session_id:
         raise HTTPException(400, "session_id required")
 
-    # Load local chat snapshot
     path = CHAT_DIR / f"{session_id}.json"
     if not path.exists():
         raise HTTPException(404, "Chat not found")
 
     messages = json.loads(path.read_text())
 
-    expires_at = datetime.utcnow() + timedelta(days=30)
+    # filter only user + assistant messages
+    messages = [
+        m for m in messages
+        if m.get("role") in ("user", "assistant")
+    ]
+
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
 
     result = supabase.table("shared_chats").insert({
         "session_id": session_id,
         "messages": messages,
-        "expires_at": expires_at.isoformat()
+        "expires_at": expires_at
     }).execute()
+
+    if not result.data:
+        raise HTTPException(500, "Failed to create share link")
 
     share_id = result.data[0]["id"]
 
     return {
-        "share_url": f"{os.getenv('APP_URL')}/share/{share_id}"
+        "share_url": f"{APP_URL}/share/{share_id}"
     }
+
 @app.get("/api/share/{share_id}")
 def get_shared_chat(share_id: str):
     result = supabase.table("shared_chats") \
@@ -105,36 +112,52 @@ def get_shared_chat(share_id: str):
 
     expires_at = result.data["expires_at"]
     if expires_at:
-        if datetime.utcnow() > datetime.fromisoformat(expires_at):
+        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) > expires:
             raise HTTPException(410, "Chat expired")
 
-    return {
-        "messages": result.data["messages"]
-    }
+    return {"messages": result.data["messages"]}
 
 # =====================================================
 # EMBEDDINGS
 # =====================================================
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 # =====================================================
 # UTILS
 # =====================================================
+
 def extract_text(file, filename: str) -> str:
     if filename.lower().endswith(".pdf"):
         reader = PdfReader(file)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
-
     if filename.lower().endswith(".docx"):
         doc = DocxDocument(file)
         return "\n".join(p.text for p in doc.paragraphs)
-
     if filename.lower().endswith(".txt"):
         return file.read().decode("utf-8")
-
     raise ValueError("Unsupported file type")
+
+def save_chat_local(session_id: str, role: str, content: str):
+    path = CHAT_DIR / f"{session_id}.json"
+    data = json.loads(path.read_text()) if path.exists() else []
+    data.append({"role": role, "content": content})
+    path.write_text(json.dumps(data, indent=2))
+
+def save_chat_db(session_id: str, source: str, question: str, answer: str):
+    supabase.table("chats").insert({
+        "session_id": session_id,
+        "source": source,
+        "question": question,
+        "answer": answer
+    }).execute()
+
+# =====================================================
+# MAIN API CONTINUES...
+# (Your /api/upload, /api/ask, /api/ask-document)
+# unchanged
+# =====================================================
+
 
 
 def save_chat_local(session_id: str, role: str, content: str):
