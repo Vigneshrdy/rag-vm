@@ -101,19 +101,28 @@ def share_chat(payload: dict):
     }
 
 @app.get("/api/share/{share_id}")
+@app.get("/api/share/{share_id}")
 def get_shared_chat(share_id: str):
-    result = supabase.table("shared_chats") \
-        .select("messages, expires_at") \
-        .eq("id", share_id) \
-        .single() \
+    result = (
+        supabase.table("shared_chats")
+        .select("messages, expires_at")
+        .eq("id", share_id)
+        .single()
         .execute()
+    )
 
     if not result.data:
         raise HTTPException(404, "Chat not found")
 
     expires_at = result.data["expires_at"]
+
     if expires_at:
-        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        expires = datetime.fromisoformat(expires_at)
+
+        # 🔥 FORCE timezone awareness
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+
         if datetime.now(timezone.utc) > expires:
             raise HTTPException(410, "Chat expired")
 
