@@ -67,37 +67,46 @@ CHAT_DIR.mkdir(exist_ok=True)
 
 @app.post("/api/share-chat")
 def share_chat(payload: dict):
-    session_id = payload.get("session_id")
-    if not session_id:
-        raise HTTPException(400, "session_id required")
+    session_id = payload["session_id"]
 
-    path = CHAT_DIR / f"{session_id}.json"
-    if not path.exists():
-        raise HTTPException(404, "Chat not found")
+    # 1️⃣ Check if already shared
+    existing = (
+        supabase.table("shared_chats")
+        .select("id")
+        .eq("session_id", session_id)
+        .maybe_single()
+        .execute()
+    )
 
-    messages = json.loads(path.read_text())
+    if existing.data:
+        share_id = existing.data["id"]
+    else:
+        # 2️⃣ Create new share
+        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
 
-    # filter only user + assistant messages
-    messages = [
-        m for m in messages
-        if m.get("role") in ("user", "assistant")
-    ]
+        chat = (
+            supabase.table("chat_sessions")
+            .select("messages")
+            .eq("session_id", session_id)
+            .single()
+            .execute()
+        )
 
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        insert = (
+            supabase.table("shared_chats")
+            .insert({
+                "session_id": session_id,
+                "messages": chat.data["messages"],
+                "expires_at": expires_at.isoformat(),
+            })
+            .execute()
+        )
 
-    result = supabase.table("shared_chats").insert({
-        "session_id": session_id,
-        "messages": messages,
-        "expires_at": expires_at
-    }).execute()
+        share_id = insert.data[0]["id"]
 
-    if not result.data:
-        raise HTTPException(500, "Failed to create share link")
-
-    share_id = result.data[0]["id"]
-
+    # 3️⃣ ALWAYS return your domain
     return {
-        "share_url": f"{APP_URL}/share/{share_id}"
+        "share_url": f"https://nyayaai.saireddy.dev/share/{share_id}"
     }
 
 @app.get("/api/share/{share_id}")
