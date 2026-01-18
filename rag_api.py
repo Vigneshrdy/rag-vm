@@ -266,11 +266,12 @@ async def upload(session_id: str, file: UploadFile = File(...)):
                 "role": "system",
                 "content": (
                     "Summarize the legal document in Markdown.\n"
-                    "Format strictly as:\n"
-                    "### Facts\n"
-                    "### Issues\n"
-                    "### Decision\n"
-                    "### Relevant Provisions"
+"Use relevant legal emojis (⚖️📄📝).\n"
+"Format strictly as:\n"
+"### Facts ⚡\n"
+"### Issues ❓\n"
+"### Decision ⚖️\n"
+"### Relevant Provisions 📜"
                 )
             },
             {"role": "user", "content": context}
@@ -312,8 +313,9 @@ def ask_document(q: DocQuery):
                 "role": "system",
                 "content": (
                     "Answer ONLY from the document.\n"
-                    "Use Markdown formatting.\n"
-                    "If not present, reply exactly: Not mentioned in the document."
+"Use Markdown formatting.\n"
+"Add relevant legal emojis (⚖️📜📝) but keep tone formal.\n"
+"If not present, reply exactly: Not mentioned in the document."
                 )
             },
             {"role": "user", "content": context + "\n\nQ: " + q.question}
@@ -344,9 +346,10 @@ def ask(q: AskQuery):
             {
                 "role": "system",
                 "content": (
-                    "You are Nyaya AI, an Indian legal assistant.\n"
-                    "Respond in Markdown.\n"
-                    "Do not give legal advice."
+                   "You are Nyaya AI, an Indian legal assistant.\n"
+    "Respond in Markdown.\n"
+    "Add emojis in a relevant, subtle, professional way (e.g., ⚖️📄📝).\n"
+    "Do not give legal advice."
                 )
             },
             {"role": "user", "content": q.question}
