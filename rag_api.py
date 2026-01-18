@@ -48,7 +48,7 @@ client = AzureOpenAI(
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-app = FastAPI(title="Nyaya AI – Full RAG API")
+app = FastAPI(title="Nyaya AI – Full RAG API", docs_url=None,redoc_url=None,openapi_url=None)
 
 # =====================================================
 # STORAGE
